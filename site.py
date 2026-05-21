@@ -281,4 +281,4 @@ if st.session_state["cliente"] == "RIO_PAX":
 elif st.session_state["cliente"] == "REVIVER":
     reviver_interface()
 else:
-    st.info("👈 Selecione um cliente ao lado para começar.")
+    st.info("Selecione um cliente em cima para começar.")
