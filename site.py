@@ -190,8 +190,14 @@ def reviver_interface():
         else:
             try:
                 # 1. Carregar as planilhas (primeira aba)
-                df_relatorio = pd.read_excel(relatorio_file, sheet_name=0)
-                df_control = pd.read_excel(control_file, sheet_name=0)
+               def get_engine(uploaded_file):
+               if uploaded_file.name.endswith('.xls'):
+                    return 'xlrd'
+                else:
+                    return 'openpyxl'
+
+df_relatorio = pd.read_excel(relatorio_file, sheet_name=0, engine=get_engine(relatorio_file))
+df_control = pd.read_excel(control_file, sheet_name=0, engine=get_engine(control_file))
                 
                 # Mostrar prévia das primeiras linhas
                 with st.expander("Prévia do Relatório"):
