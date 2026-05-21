@@ -173,8 +173,14 @@ def rio_pax_interface():
 # FUNÇÃO ESPECÍFICA PARA REVIVER (baseada no merge.py)
 # ------------------------------------------------------------
 def reviver_interface():
-    st.header("REVIVER - Merge entre Relatório e Control Desk")
+    st.header("🔄 REVIVER - Merge entre Relatório e Control Desk")
     
+    st.markdown("""
+    **Regras do merge:**
+    - O **relatório** deve ter a chave na **primeira coluna** (coluna A).
+    - O **control desk** deve ter a chave na **coluna G** (sétima coluna) e o valor desejado na **coluna A**.
+    - O resultado trará todas as linhas do relatório, acrescentando a coluna `informacao_control_desk`.
+    """)
     
     col1, col2 = st.columns(2)
     with col1:
@@ -189,15 +195,16 @@ def reviver_interface():
             st.error("É necessário enviar ambos os arquivos (Relatório e Control Desk).")
         else:
             try:
-                # 1. Carregar as planilhas (primeira aba)
-               def get_engine(uploaded_file):
-               if uploaded_file.name.endswith('.xls'):
-                    return 'xlrd'
-                else:
-                    return 'openpyxl'
-
-df_relatorio = pd.read_excel(relatorio_file, sheet_name=0, engine=get_engine(relatorio_file))
-df_control = pd.read_excel(control_file, sheet_name=0, engine=get_engine(control_file))
+                # Define engine baseado na extensão do arquivo
+                def get_engine(uploaded_file):
+                    if uploaded_file.name.endswith('.xls'):
+                        return 'xlrd'
+                    else:
+                        return 'openpyxl'
+                
+                # Carregar as planilhas (primeira aba) usando o engine correto
+                df_relatorio = pd.read_excel(relatorio_file, sheet_name=0, engine=get_engine(relatorio_file))
+                df_control = pd.read_excel(control_file, sheet_name=0, engine=get_engine(control_file))
                 
                 # Mostrar prévia das primeiras linhas
                 with st.expander("Prévia do Relatório"):
@@ -205,7 +212,7 @@ df_control = pd.read_excel(control_file, sheet_name=0, engine=get_engine(control
                 with st.expander("Prévia do Control Desk"):
                     st.dataframe(df_control.head())
                 
-                # 2. Identificar as colunas pelas posições
+                # Identificar as colunas pelas posições
                 col_chave_relatorio = df_relatorio.columns[0]          # primeira coluna
                 col_chave_control = df_control.columns[6]              # sétima coluna (índice 6)
                 col_valor_control = df_control.columns[0]              # primeira coluna
@@ -214,12 +221,12 @@ df_control = pd.read_excel(control_file, sheet_name=0, engine=get_engine(control
                 st.info(f"Chave no control desk: **{col_chave_control}**")
                 st.info(f"Valor a ser trazido: **{col_valor_control}**")
                 
-                # 3. Renomear temporariamente para facilitar o merge
+                # Renomear temporariamente para facilitar o merge
                 df_relatorio_ren = df_relatorio.rename(columns={col_chave_relatorio: 'chave_relatorio'})
                 df_control_ren = df_control.rename(columns={col_chave_control: 'chave_controle',
                                                             col_valor_control: 'valor_retornar'})
                 
-                # 4. Left join
+                # Left join
                 resultado = df_relatorio_ren.merge(
                     df_control_ren[['chave_controle', 'valor_retornar']],
                     left_on='chave_relatorio',
@@ -227,19 +234,19 @@ df_control = pd.read_excel(control_file, sheet_name=0, engine=get_engine(control
                     how='left'
                 )
                 
-                # 5. Remover coluna auxiliar e renomear a coluna de valor
+                # Remover coluna auxiliar e renomear a coluna de valor
                 resultado.drop(columns=['chave_controle'], inplace=True)
                 resultado.rename(columns={'valor_retornar': 'informacao_control_desk'}, inplace=True)
                 
-                # 6. Restaurar nome original da coluna chave do relatório
+                # Restaurar nome original da coluna chave do relatório
                 resultado.rename(columns={'chave_relatorio': col_chave_relatorio}, inplace=True)
                 
-                # 7. Mostrar resultado
+                # Mostrar resultado
                 st.subheader("Resultado do Merge")
                 st.dataframe(resultado.head(100))
                 st.success(f"Total de linhas no resultado: {len(resultado)}")
                 
-                # 8. Download do Excel
+                # Download do Excel
                 output = BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
                     resultado.to_excel(writer, index=False, sheet_name='Merge_Resultado')
@@ -255,7 +262,6 @@ df_control = pd.read_excel(control_file, sheet_name=0, engine=get_engine(control
             except Exception as e:
                 st.error(f"Erro durante o processamento: {str(e)}")
                 st.exception(e)
-
 # ------------------------------------------------------------
 # MAIN PAGE
 # ------------------------------------------------------------
