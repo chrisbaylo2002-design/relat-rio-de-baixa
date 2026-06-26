@@ -4,105 +4,191 @@ import re
 import pandas as pd
 import numpy as np
 from io import BytesIO
+import os
 
 # ------------------------------------------------------------
-# FUNÇÕES COMPARTILHADAS (cache e processamento RIO PAX)
+# FUNÇÕES COMPARTILHADAS
 # ------------------------------------------------------------
-@st.cache_data
-def extrair_texto_pdfs(uploaded_pdfs):
-    texto_completo = ""
-    for nome_arquivo, conteudo in uploaded_pdfs.items():
-        if nome_arquivo.lower().endswith('.pdf'):
-            with pdfplumber.open(BytesIO(conteudo)) as pdf:
-                texto_completo += f"\n\n{'='*50}\n"
-                texto_completo += f"ARQUIVO: {nome_arquivo}\n"
-                texto_completo += f"{'='*50}\n\n"
-                for i, pagina in enumerate(pdf.pages):
-                    texto = pagina.extract_text(layout=True)
-                    if texto:
-                        texto_completo += f"===== Página {i+1} =====\n{texto}\n\n"
-    return texto_completo
 
-@st.cache_data
-def parse_extrato(texto):
-    lines = [line.strip() for line in texto.split('\n') if line.strip()]
+def extrair_numero_apos_barra(os_contrato):
+    """
+    Extrai o número após a barra em os_contrato
+    Exemplo: '422633 / 244906' -> '244906'
+    """
+    if pd.isna(os_contrato):
+        return None
+    
+    # Converte para string
+    os_contrato = str(os_contrato)
+    
+    # Busca padrão: número após a barra
+    padrao = r'(?:/\s*)(\d+)'
+    match = re.search(padrao, os_contrato)
+    
+    if match:
+        return match.group(1)
+    return None
 
-    data_line_pattern = re.compile(
-        r'^(\S+)\s+(\d{2}/\d{2}/\d{4})\s+(\S+)\s+(\d{2}/\d{2}/\d{4})\s+'
-        r'(.*?)\s+(\d+\s*/\s*\d+)\s+(.*?)\s+(\S+)\s+(\S+)\s+([\d\.,]+)\s+(\d+)$'
-    )
-    section_pattern = re.compile(r'^(\w+)\s*-\s*(CREDITO|DEBITO|FATURADO|PIX)')
-    total_pattern = re.compile(r'^Total\s+_______|^Total Geral')
-    ignore_patterns = [
-        re.compile(r'Extrato de caixa'), re.compile(r'Baixa Inicial|Baixa Final'),
-        re.compile(r'MS Consultoria'), re.compile(r'Página'),
-        re.compile(r'^\d{2}/\d{2}/\d{4}'), re.compile(r'RIO PAX'), re.compile(r'JULIAC'),
-    ]
+def ler_planilha_com_engine(arquivo_bytes, nome_arquivo):
+    """
+    Tenta ler a planilha usando diferentes engines
+    Suporta arquivos .XLS e .XLSX
+    """
+    # Lista de engines para tentar
+    engines = ['xlrd', 'openpyxl', 'odf', None]
+    
+    # Salva temporariamente o arquivo para leitura
+    import tempfile
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(nome_arquivo)[1]) as tmp_file:
+        tmp_file.write(arquivo_bytes)
+        tmp_path = tmp_file.name
+    
+    try:
+        for engine in engines:
+            try:
+                if engine is None:
+                    df = pd.read_excel(tmp_path, sheet_name=0)
+                else:
+                    df = pd.read_excel(tmp_path, sheet_name=0, engine=engine)
+                return df
+            except:
+                continue
+        
+        # Último recurso: tenta com xlrd manual
+        try:
+            import xlrd
+            workbook = xlrd.open_workbook(tmp_path, encoding_override='latin-1')
+            sheet = workbook.sheet_by_index(0)
+            data = []
+            for row_idx in range(sheet.nrows):
+                row_data = []
+                for col_idx in range(sheet.ncols):
+                    cell = sheet.cell_value(row_idx, col_idx)
+                    row_data.append(cell)
+                data.append(row_data)
+            if data:
+                headers = data[0]
+                values = data[1:]
+                df = pd.DataFrame(values, columns=headers)
+                return df
+        except:
+            pass
+        
+        raise Exception("Não foi possível ler o arquivo com nenhum engine")
+    finally:
+        # Limpa o arquivo temporário
+        try:
+            os.unlink(tmp_path)
+        except:
+            pass
 
-    def is_ignored(line):
-        return any(p.search(line) for p in ignore_patterns)
-
-    transactions = []
-    current_section = None
-
-    for i, line in enumerate(lines):
-        if section_pattern.match(line):
-            current_section = line
+def consolidar_multiplos_excel(arquivos_upload):
+    """
+    Lê múltiplos arquivos Excel e consolida em um único DataFrame
+    """
+    dfs = []
+    nomes_arquivos = []
+    
+    for arquivo in arquivos_upload:
+        try:
+            # Lê o arquivo
+            df = ler_planilha_com_engine(arquivo.read(), arquivo.name)
+            
+            # Adiciona coluna com nome do arquivo de origem
+            df['arquivo_origem'] = arquivo.name
+            
+            dfs.append(df)
+            nomes_arquivos.append(arquivo.name)
+            
+            # Reset do ponteiro do arquivo
+            arquivo.seek(0)
+            
+        except Exception as e:
+            st.warning(f"⚠️ Erro ao ler o arquivo {arquivo.name}: {str(e)}")
             continue
-        if is_ignored(line) or total_pattern.match(line):
-            continue
-        match = data_line_pattern.match(line)
-        if not match:
-            continue
+    
+    if not dfs:
+        raise Exception("Nenhum arquivo pôde ser lido com sucesso.")
+    
+    # Concatena todos os DataFrames
+    df_consolidado = pd.concat(dfs, ignore_index=True)
+    
+    return df_consolidado, nomes_arquivos
 
-        desc = None
-        suffix = None
-        if i > 0 and not is_ignored(lines[i-1]) and not data_line_pattern.match(lines[i-1]):
-            desc = lines[i-1]
-        if i+1 < len(lines) and not is_ignored(lines[i+1]) and not data_line_pattern.match(lines[i+1]):
-            suffix = lines[i+1]
-
-        groups = match.groups()
-        transaction = {
-            'secao': current_section,
-            'descricao': desc,
-            'sufixo': suffix,
-            'deonde': groups[0],
-            'dt_baixa': groups[1],
-            'usuario': groups[2],
-            'dt_pgto': groups[3],
-            'cobrador': groups[4].strip(),
-            'pacote_os_contrato': groups[5].strip(),
-            'nome': groups[6].strip(),
-            'referencia': groups[7],
-            'documento': groups[8],
-            'valor': groups[9].replace('.', '').replace(',', '.'),
-            'nfs_e': groups[10],
-        }
-        transactions.append(transaction)
-    return transactions
-
-def separar_pacote_os(df):
-    split_df = df['pacote_os_contrato'].str.split(' / ', expand=True)
-    split_df.columns = ['contrato', 'os']
-    split_df['contrato'] = split_df['contrato'].astype(str).str.lstrip('0')
-    split_df['os'] = split_df['os'].astype(str).str.lstrip('0')
-    df = df.drop(columns=['pacote_os_contrato'])
-    col_index = df.columns.get_loc('cobrador') + 1
-    df.insert(col_index, 'contrato', split_df['contrato'])
-    df.insert(col_index + 1, 'os', split_df['os'])
-    return df
-
-def merge_control_desk(df, control_desk_df):
-    col_chave = 'COD EXTERNO'
-    col_valor = 'PROCESSO'
-    if control_desk_df is not None and col_chave in control_desk_df.columns and col_valor in control_desk_df.columns:
-        mapa = control_desk_df.set_index(col_chave)[col_valor].to_dict()
-        df['control_desk_info'] = df['os'].map(mapa).fillna('NA')
-        st.success("✅ Merge realizado com sucesso!")
-    else:
-        st.warning(f"Arquivo Control Desk não fornecido ou colunas '{col_chave}'/'{col_valor}' não encontradas. 'control_desk_info' = 'NA'")
-        df['control_desk_info'] = 'NA'
+def merge_control_desk_melhorado(df, control_desk_df, nome_cliente="Relatório"):
+    """
+    Faz o merge entre o relatório e o control desk usando a lógica:
+    - Extrai número após a barra em 'os_contrato'
+    - Compara com 'COD EXTERNO'
+    - Traz o 'PROCESSO'
+    """
+    # Verifica se as colunas necessárias existem
+    if 'os_contrato' not in df.columns:
+        st.error(f"❌ Coluna 'os_contrato' não encontrada no {nome_cliente}!")
+        st.info(f"Colunas disponíveis: {', '.join(df.columns.tolist())}")
+        return df
+    
+    if 'COD EXTERNO' not in control_desk_df.columns or 'PROCESSO' not in control_desk_df.columns:
+        st.error("❌ Colunas 'COD EXTERNO' e/ou 'PROCESSO' não encontradas no Control Desk!")
+        st.info(f"Colunas disponíveis: {', '.join(control_desk_df.columns.tolist())}")
+        return df
+    
+    with st.spinner("🔍 Extraindo números após a barra..."):
+        # Extrai o número após a barra
+        df['numero_extraido'] = df['os_contrato'].apply(extrair_numero_apos_barra)
+        
+        # Mostra estatísticas
+        total_com_numero = df['numero_extraido'].notna().sum()
+        st.info(f"📊 Registros com número extraído: {total_com_numero} de {len(df)}")
+        
+        # Mostra exemplos
+        if total_com_numero > 0:
+            with st.expander("📋 Exemplos de números extraídos"):
+                exemplos = df[df['numero_extraido'].notna()][['os_contrato', 'numero_extraido']].head(10)
+                if 'arquivo_origem' in df.columns:
+                    exemplos = df[df['numero_extraido'].notna()][['os_contrato', 'numero_extraido', 'arquivo_origem']].head(10)
+                st.dataframe(exemplos)
+    
+    with st.spinner("🔄 Realizando merge com Control Desk..."):
+        # Converte para string para comparação
+        control_desk_df['COD_EXTERNO_STR'] = control_desk_df['COD EXTERNO'].astype(str).str.strip()
+        df['numero_extraido'] = df['numero_extraido'].astype(str).str.strip()
+        
+        # Cria dicionário de mapeamento
+        mapa_processo = dict(zip(control_desk_df['COD_EXTERNO_STR'], control_desk_df['PROCESSO']))
+        
+        # Adiciona a informação do Control Desk
+        df['informacao_control_desk'] = df['numero_extraido'].map(mapa_processo)
+        
+        # Preenche com 'NA' onde não houve match
+        df['informacao_control_desk'] = df['informacao_control_desk'].fillna('NA')
+        
+        # Estatísticas do merge
+        total_matches = (df['informacao_control_desk'] != 'NA').sum()
+        st.success(f"✅ Matches encontrados: {total_matches} de {total_com_numero}")
+        
+        if total_com_numero > 0:
+            taxa_match = (total_matches / total_com_numero) * 100
+            st.info(f"📈 Taxa de match: {taxa_match:.2f}%")
+        
+        # Mostra exemplos de matches
+        if total_matches > 0:
+            with st.expander("🎯 Exemplos de matches encontrados"):
+                cols = ['os_contrato', 'numero_extraido', 'informacao_control_desk']
+                if 'arquivo_origem' in df.columns:
+                    cols.append('arquivo_origem')
+                matches = df[df['informacao_control_desk'] != 'NA'][cols].head(10)
+                st.dataframe(matches)
+        
+        # Mostra exemplos sem match
+        sem_match = df[(df['numero_extraido'].notna()) & (df['informacao_control_desk'] == 'NA')]
+        if len(sem_match) > 0:
+            with st.expander("⚠️ Exemplos sem match"):
+                cols = ['os_contrato', 'numero_extraido']
+                if 'arquivo_origem' in df.columns:
+                    cols.append('arquivo_origem')
+                st.dataframe(sem_match[cols].head(10))
+    
     return df
 
 def limpar_df(df):
@@ -113,143 +199,275 @@ def limpar_df(df):
     return df
 
 # ------------------------------------------------------------
-# FUNÇÃO ESPECÍFICA PARA RIO PAX
+# FUNÇÃO RIO PAX - VERSÃO COM MÚLTIPLOS ARQUIVOS
 # ------------------------------------------------------------
 def rio_pax_interface():
-    st.header(" RIO PAX - Extração e estruturação de extratos PDF")
+    st.header("🏦 RIO PAX - Processamento de Múltiplos Relatórios Excel")
     
-    pdf_files = st.file_uploader("Selecione um ou mais PDFs do RIO PAX", type="pdf", accept_multiple_files=True)
-    control_file = st.file_uploader("Arquivo Control Desk (Excel com colunas 'COD EXTERNO' e 'PROCESSO')", type=["xlsx", "xls"])
+    st.markdown("""
+    **Como funciona:**
+    1. Faça upload de **um ou mais** relatórios Excel do RIO PAX (todos com a coluna `os_contrato`)
+    2. Faça upload do arquivo Control Desk (contém `COD EXTERNO` e `PROCESSO`)
+    3. O script consolida todos os relatórios em um único DataFrame
+    4. Extrai o número **após a barra** em `os_contrato` (ex: `422633 / 244906` → `244906`)
+    5. Compara com `COD EXTERNO` do Control Desk
+    6. Quando encontra match, traz a informação da coluna `PROCESSO`
+    """)
     
-    processar = st.button("🚀 Processar PDFs e gerar Excel", type="primary")
+    col1, col2 = st.columns(2)
+    with col1:
+        relatorios_files = st.file_uploader(
+            "📁 Arquivos do Relatório RIO PAX (Excel)", 
+            type=["xls", "xlsx"], 
+            key="rio_pax_relatorios",
+            accept_multiple_files=True,  # Permite múltiplos arquivos
+            help="Selecione um ou mais arquivos Excel com a coluna 'os_contrato'"
+        )
+    with col2:
+        control_file = st.file_uploader(
+            "📁 Arquivo Control Desk (Excel)", 
+            type=["xls", "xlsx"], 
+            key="rio_pax_control",
+            help="Arquivo que contém 'COD EXTERNO' e 'PROCESSO'"
+        )
+    
+    # Opção para escolher qual coluna usar no relatório
+    if relatorios_files and len(relatorios_files) > 0:
+        try:
+            # Tenta ler o primeiro arquivo para identificar colunas
+            df_temp = ler_planilha_com_engine(relatorios_files[0].read(), relatorios_files[0].name)
+            relatorios_files[0].seek(0)  # Reset do ponteiro do arquivo
+            colunas_relatorio = df_temp.columns.tolist()
+            
+            coluna_os = st.selectbox(
+                "🔍 Selecione a coluna que contém 'os_contrato' nos relatórios:",
+                options=colunas_relatorio,
+                index=colunas_relatorio.index('os_contrato') if 'os_contrato' in colunas_relatorio else 0,
+                help="Esta coluna deve conter valores como '422633 / 244906'"
+            )
+        except:
+            coluna_os = 'os_contrato'
+            st.warning("Não foi possível ler o arquivo para identificar colunas. Usando 'os_contrato' como padrão.")
+    else:
+        coluna_os = 'os_contrato'
+    
+    processar = st.button("🚀 Processar Múltiplos Arquivos e gerar Excel", type="primary")
     
     if processar:
-        if not pdf_files:
-            st.error("Envie pelo menos um arquivo PDF.")
+        if not relatorios_files:
+            st.error("❌ Envie pelo menos um arquivo do Relatório RIO PAX.")
+        elif control_file is None:
+            st.error("❌ Envie o arquivo Control Desk.")
         else:
-            pdf_dict = {pdf.name: pdf.read() for pdf in pdf_files}
-            
-            with st.status("Extraindo texto dos PDFs...", expanded=True) as status:
-                texto_consolidado = extrair_texto_pdfs(pdf_dict)
-                status.update(label="Texto extraído com sucesso!", state="complete")
-            
-            with st.spinner("Parseando transações..."):
-                transacoes = parse_extrato(texto_consolidado)
-                if not transacoes:
-                    st.error("Nenhuma transação encontrada. Verifique o formato do extrato.")
-                    st.stop()
-                df = pd.DataFrame(transacoes)
-                st.info(f"Total de transações encontradas: {len(df)}")
-            
-            with st.spinner("Separando coluna 'pacote_os_contrato'..."):
-                df = separar_pacote_os(df)
-            
-            if control_file:
-                with st.spinner("Lendo Control Desk e aplicando merge..."):
-                    control_desk_df = pd.read_excel(control_file)
-                    df = merge_control_desk(df, control_desk_df)
-            else:
-                df['control_desk_info'] = 'NA'
-            
-            df = limpar_df(df)
-            
-            st.subheader("Prévia dos dados processados")
-            st.dataframe(df.head(100))
-            
-            output = BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df.to_excel(writer, index=False, sheet_name='Extrato')
-            excel_data = output.getvalue()
-            
-            st.download_button(
-                label="📥 Baixar Excel (rio_pax_extrato.xlsx)",
-                data=excel_data,
-                file_name="rio_pax_extrato.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-            st.success("Processamento concluído!")
+            try:
+                # 1. Carregar e consolidar os relatórios
+                with st.spinner(f"📂 Carregando e consolidando {len(relatorios_files)} arquivos..."):
+                    df_relatorio, nomes_arquivos = consolidar_multiplos_excel(relatorios_files)
+                    
+                # 2. Carregar Control Desk
+                with st.spinner("📂 Carregando Control Desk..."):
+                    df_control = ler_planilha_com_engine(control_file.read(), control_file.name)
+                
+                # Mostrar informações
+                st.success(f"✅ {len(relatorios_files)} arquivos consolidados com sucesso!")
+                st.info(f"📊 Total de registros consolidados: {len(df_relatorio)}")
+                
+                with st.expander("📋 Arquivos processados"):
+                    for nome in nomes_arquivos:
+                        st.write(f"- {nome}")
+                
+                # Mostrar prévia
+                with st.expander("📊 Prévia do Relatório Consolidado"):
+                    st.dataframe(df_relatorio.head())
+                with st.expander("📊 Prévia do Control Desk"):
+                    st.dataframe(df_control.head())
+                
+                # Verifica se a coluna existe
+                if coluna_os not in df_relatorio.columns:
+                    st.error(f"❌ Coluna '{coluna_os}' não encontrada no relatório!")
+                    st.info(f"Colunas disponíveis: {', '.join(df_relatorio.columns.tolist())}")
+                    return
+                
+                # Renomeia a coluna para padronizar
+                if coluna_os != 'os_contrato':
+                    df_relatorio.rename(columns={coluna_os: 'os_contrato'}, inplace=True)
+                
+                # 3. Aplica o merge melhorado
+                df_resultado = merge_control_desk_melhorado(df_relatorio, df_control, "Relatórios RIO PAX")
+                
+                # 4. Limpeza final
+                df_resultado = limpar_df(df_resultado)
+                
+                # 5. Mostrar resultado
+                st.subheader("📊 Resultado do Processamento")
+                st.dataframe(df_resultado.head(100))
+                
+                # Estatísticas
+                col1, col2, col3, col4 = st.columns(4)
+                with col1:
+                    st.metric("Total de registros", len(df_resultado))
+                with col2:
+                    st.metric("Arquivos processados", len(relatorios_files))
+                with col3:
+                    total_com_numero = df_resultado['numero_extraido'].notna().sum()
+                    st.metric("Com número extraído", total_com_numero)
+                with col4:
+                    total_matches = (df_resultado['informacao_control_desk'] != 'NA').sum()
+                    st.metric("Matches encontrados", total_matches)
+                
+                # 6. Download do Excel
+                output = BytesIO()
+                with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                    # Sheet com resultado completo
+                    df_resultado.to_excel(writer, index=False, sheet_name='Resultado_Completo')
+                    
+                    # Sheet com apenas os matches
+                    matches = df_resultado[df_resultado['informacao_control_desk'] != 'NA']
+                    if not matches.empty:
+                        matches.to_excel(writer, index=False, sheet_name='Apenas_Matches')
+                    
+                    # Sheet com apenas sem match
+                    sem_match = df_resultado[(df_resultado['numero_extraido'].notna()) & 
+                                            (df_resultado['informacao_control_desk'] == 'NA')]
+                    if not sem_match.empty:
+                        sem_match.to_excel(writer, index=False, sheet_name='Sem_Match')
+                    
+                    # Resumo por arquivo (se a coluna existir)
+                    if 'arquivo_origem' in df_resultado.columns:
+                        resumo_arquivos = df_resultado.groupby('arquivo_origem').agg({
+                            'numero_extraido': lambda x: x.notna().sum(),
+                            'informacao_control_desk': lambda x: (x != 'NA').sum()
+                        }).reset_index()
+                        resumo_arquivos.columns = ['Arquivo', 'Com_Número_Extraído', 'Matches']
+                        resumo_arquivos.to_excel(writer, index=False, sheet_name='Resumo_por_Arquivo')
+                
+                excel_data = output.getvalue()
+                
+                st.download_button(
+                    label="📥 Baixar Excel (rio_pax_consolidado.xlsx)",
+                    data=excel_data,
+                    file_name="rio_pax_consolidado.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+                
+                st.success("✅ Processamento concluído com sucesso!")
+                
+            except Exception as e:
+                st.error(f"❌ Erro durante o processamento: {str(e)}")
+                st.exception(e)
 
 # ------------------------------------------------------------
-# FUNÇÃO ESPECÍFICA PARA REVIVER (baseada no merge.py)
+# FUNÇÃO REVIVER - MANTIDA IGUAL
 # ------------------------------------------------------------
 def reviver_interface():
     st.header("🔄 REVIVER - Merge entre Relatório e Control Desk")
     
     st.markdown("""
-    **Regras do merge:**
-    - O **relatório** deve ter a chave na **primeira coluna** (coluna A).
-    - O **control desk** deve ter a chave na **coluna G** (sétima coluna) e o valor desejado na **coluna A**.
-    - O resultado trará todas as linhas do relatório, acrescentando a coluna `informacao_control_desk`.
+    **Como funciona:**
+    1. O script extrai o número **após a barra** em `os_contrato` (ex: `422633 / 244906` → `244906`)
+    2. Compara com a coluna `COD EXTERNO` do Control Desk
+    3. Quando encontra match, traz a informação da coluna `PROCESSO`
     """)
     
     col1, col2 = st.columns(2)
     with col1:
-        relatorio_file = st.file_uploader("📁 Arquivo do Relatório (Excel)", type=["xls", "xlsx"], key="reviver_relatorio")
+        relatorio_file = st.file_uploader(
+            "📁 Arquivo do Relatório (Excel)", 
+            type=["xls", "xlsx"], 
+            key="reviver_relatorio",
+            help="Arquivo que contém a coluna 'os_contrato'"
+        )
     with col2:
-        control_file = st.file_uploader("📁 Arquivo Control Desk (Excel)", type=["xls", "xlsx"], key="reviver_control")
+        control_file = st.file_uploader(
+            "📁 Arquivo Control Desk (Excel)", 
+            type=["xls", "xlsx"], 
+            key="reviver_control",
+            help="Arquivo que contém 'COD EXTERNO' e 'PROCESSO'"
+        )
+    
+    # Opção para escolher qual coluna usar no relatório
+    if relatorio_file:
+        try:
+            df_temp = pd.read_excel(relatorio_file, sheet_name=0, nrows=5)
+            colunas_relatorio = df_temp.columns.tolist()
+            
+            coluna_os = st.selectbox(
+                "🔍 Selecione a coluna que contém 'os_contrato' no relatório:",
+                options=colunas_relatorio,
+                index=colunas_relatorio.index('os_contrato') if 'os_contrato' in colunas_relatorio else 0,
+                help="Esta coluna deve conter valores como '422633 / 244906'"
+            )
+        except:
+            coluna_os = 'os_contrato'
+            st.warning("Não foi possível ler o arquivo para identificar colunas. Usando 'os_contrato' como padrão.")
+    else:
+        coluna_os = 'os_contrato'
     
     processar = st.button("🔄 Realizar Merge e gerar Excel", type="primary")
     
     if processar:
         if relatorio_file is None or control_file is None:
-            st.error("É necessário enviar ambos os arquivos (Relatório e Control Desk).")
+            st.error("❌ É necessário enviar ambos os arquivos (Relatório e Control Desk).")
         else:
             try:
-                # Define engine baseado na extensão do arquivo
-                def get_engine(uploaded_file):
-                    if uploaded_file.name.endswith('.xls'):
-                        return 'xlrd'
-                    else:
-                        return 'openpyxl'
+                # 1. Carregar as planilhas
+                with st.spinner("📂 Carregando arquivos..."):
+                    df_relatorio = pd.read_excel(relatorio_file, sheet_name=0)
+                    df_control = pd.read_excel(control_file, sheet_name=0)
                 
-                # Carregar as planilhas (primeira aba) usando o engine correto
-                df_relatorio = pd.read_excel(relatorio_file, sheet_name=0, engine=get_engine(relatorio_file))
-                df_control = pd.read_excel(control_file, sheet_name=0, engine=get_engine(control_file))
-                
-                # Mostrar prévia das primeiras linhas
-                with st.expander("Prévia do Relatório"):
+                # Mostrar prévia
+                with st.expander("📊 Prévia do Relatório"):
                     st.dataframe(df_relatorio.head())
-                with st.expander("Prévia do Control Desk"):
+                with st.expander("📊 Prévia do Control Desk"):
                     st.dataframe(df_control.head())
                 
-                # Identificar as colunas pelas posições
-                col_chave_relatorio = df_relatorio.columns[0]          # primeira coluna
-                col_chave_control = df_control.columns[6]              # sétima coluna (índice 6)
-                col_valor_control = df_control.columns[0]              # primeira coluna
+                # Verifica se a coluna existe
+                if coluna_os not in df_relatorio.columns:
+                    st.error(f"❌ Coluna '{coluna_os}' não encontrada no relatório!")
+                    st.info(f"Colunas disponíveis: {', '.join(df_relatorio.columns.tolist())}")
+                    return
                 
-                st.info(f"Chave no relatório: **{col_chave_relatorio}**")
-                st.info(f"Chave no control desk: **{col_chave_control}**")
-                st.info(f"Valor a ser trazido: **{col_valor_control}**")
+                # Renomeia a coluna para padronizar
+                if coluna_os != 'os_contrato':
+                    df_relatorio.rename(columns={coluna_os: 'os_contrato'}, inplace=True)
                 
-                # Renomear temporariamente para facilitar o merge
-                df_relatorio_ren = df_relatorio.rename(columns={col_chave_relatorio: 'chave_relatorio'})
-                df_control_ren = df_control.rename(columns={col_chave_control: 'chave_controle',
-                                                            col_valor_control: 'valor_retornar'})
+                # 2. Aplica o merge melhorado
+                df_resultado = merge_control_desk_melhorado(df_relatorio, df_control, "Relatório REVIVER")
                 
-                # Left join
-                resultado = df_relatorio_ren.merge(
-                    df_control_ren[['chave_controle', 'valor_retornar']],
-                    left_on='chave_relatorio',
-                    right_on='chave_controle',
-                    how='left'
-                )
+                # 3. Limpeza final
+                df_resultado = limpar_df(df_resultado)
                 
-                # Remover coluna auxiliar e renomear a coluna de valor
-                resultado.drop(columns=['chave_controle'], inplace=True)
-                resultado.rename(columns={'valor_retornar': 'informacao_control_desk'}, inplace=True)
+                # 4. Mostrar resultado
+                st.subheader("📊 Resultado do Merge")
+                st.dataframe(df_resultado.head(100))
                 
-                # Restaurar nome original da coluna chave do relatório
-                resultado.rename(columns={'chave_relatorio': col_chave_relatorio}, inplace=True)
+                # Estatísticas
+                col1, col2, col3 = st.columns(3)
+                with col1:
+                    st.metric("Total de linhas", len(df_resultado))
+                with col2:
+                    total_com_numero = df_resultado['numero_extraido'].notna().sum()
+                    st.metric("Com número extraído", total_com_numero)
+                with col3:
+                    total_matches = (df_resultado['informacao_control_desk'] != 'NA').sum()
+                    st.metric("Matches encontrados", total_matches)
                 
-                # Mostrar resultado
-                st.subheader("Resultado do Merge")
-                st.dataframe(resultado.head(100))
-                st.success(f"Total de linhas no resultado: {len(resultado)}")
-                
-                # Download do Excel
+                # 5. Download do Excel
                 output = BytesIO()
                 with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                    resultado.to_excel(writer, index=False, sheet_name='Merge_Resultado')
+                    df_resultado.to_excel(writer, index=False, sheet_name='Merge_Resultado')
+                    
+                    # Adiciona sheet com apenas os matches
+                    matches = df_resultado[df_resultado['informacao_control_desk'] != 'NA']
+                    if not matches.empty:
+                        matches.to_excel(writer, index=False, sheet_name='Apenas_Matches')
+                    
+                    # Adiciona sheet com apenas sem match
+                    sem_match = df_resultado[(df_resultado['numero_extraido'].notna()) & 
+                                            (df_resultado['informacao_control_desk'] == 'NA')]
+                    if not sem_match.empty:
+                        sem_match.to_excel(writer, index=False, sheet_name='Sem_Match')
+                
                 excel_data = output.getvalue()
                 
                 st.download_button(
@@ -259,26 +477,29 @@ def reviver_interface():
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
                 
+                st.success("✅ Processamento concluído com sucesso!")
+                
             except Exception as e:
-                st.error(f"Erro durante o processamento: {str(e)}")
+                st.error(f"❌ Erro durante o processamento: {str(e)}")
                 st.exception(e)
+
 # ------------------------------------------------------------
 # MAIN PAGE
 # ------------------------------------------------------------
 st.set_page_config(page_title="Real Cobrança - Relatórios de Baixa", layout="wide")
 
 # Título principal
-st.title(" 💲 REAL COBRANÇA RELATÓRIOS DE BAIXA")
+st.title("💰 REAL COBRANÇA RELATÓRIOS DE BAIXA")
 st.markdown("---")
 st.markdown("Selecione qual dos credores deseja realizar a baixa de títulos, serão gerados arquivos formato excel para facilitação do processo")
 
 # Seleção do cliente (botões lado a lado)
 col1, col2 = st.columns(2)
 with col1:
-    if st.button("RIO PAX", use_container_width=True):
+    if st.button("🏦 RIO PAX", use_container_width=True):
         st.session_state["cliente"] = "RIO_PAX"
 with col2:
-    if st.button("REVIVER", use_container_width=True):
+    if st.button("🔄 REVIVER", use_container_width=True):
         st.session_state["cliente"] = "REVIVER"
 
 # Define cliente padrão (primeira execução)
@@ -293,4 +514,4 @@ if st.session_state["cliente"] == "RIO_PAX":
 elif st.session_state["cliente"] == "REVIVER":
     reviver_interface()
 else:
-    st.info("Selecione um cliente em cima para começar.")
+    st.info("👈 Selecione um cliente ao lado para começar.")
