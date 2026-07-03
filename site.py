@@ -133,14 +133,41 @@ def extrair_numero_apos_barra(os_contrato):
     """
     Extrai o número após a barra em os_contrato
     Exemplo: '422633 / 244906' -> '244906'
+    Também funciona com: '422633/244906', '422633 - 244906', '000000 / 196933' -> '196933'
     """
     if pd.isna(os_contrato):
         return None
-    os_contrato = str(os_contrato)
-    padrao = r'(?:/\s*)(\d+)'
-    match = re.search(padrao, os_contrato)
+    
+    os_contrato = str(os_contrato).strip()
+    
+    # Padrão 1: espaço barra espaço (formato mais comum)
+    padrao1 = r'(?:/\s*)(\d+)'
+    match = re.search(padrao1, os_contrato)
     if match:
-        return match.group(1)
+        return match.group(1).lstrip('0')
+    
+    # Padrão 2: apenas barra sem espaços
+    padrao2 = r'/(\d+)'
+    match = re.search(padrao2, os_contrato)
+    if match:
+        return match.group(1).lstrip('0')
+    
+    # Padrão 3: hífen com espaços
+    padrao3 = r'(?:-\s*)(\d+)'
+    match = re.search(padrao3, os_contrato)
+    if match:
+        return match.group(1).lstrip('0')
+    
+    # Padrão 4: se não tiver separador, pega o último número
+    numeros = re.findall(r'\d+', os_contrato)
+    if len(numeros) >= 2:
+        return numeros[-1].lstrip('0')
+    
+    # Padrão 5: tenta pegar qualquer número no final
+    match = re.search(r'(\d+)$', os_contrato)
+    if match:
+        return match.group(1).lstrip('0')
+    
     return None
 
 
@@ -247,7 +274,9 @@ def merge_control_desk_melhorado(df, control_desk_df, nome_cliente="Relatório")
 
     with st.spinner("🔄 Realizando merge com Control Desk..."):
         control_desk_df['COD_EXTERNO_STR'] = control_desk_df['COD EXTERNO'].astype(str).str.strip()
+        control_desk_df['COD_EXTERNO_STR'] = control_desk_df['COD_EXTERNO_STR'].str.lstrip('0')
         df['numero_extraido'] = df['numero_extraido'].astype(str).str.strip()
+        df['numero_extraido'] = df['numero_extraido'].str.lstrip('0')
 
         mapa_processo = dict(zip(control_desk_df['COD_EXTERNO_STR'], control_desk_df['PROCESSO']))
         df['informacao_control_desk'] = df['numero_extraido'].map(mapa_processo)
@@ -272,6 +301,60 @@ def merge_control_desk_melhorado(df, control_desk_df, nome_cliente="Relatório")
         if len(sem_match) > 0:
             with st.expander("⚠️ Exemplos sem match"):
                 cols = ['os_contrato', 'numero_extraido']
+                if 'arquivo_origem' in df.columns:
+                    cols.append('arquivo_origem')
+                st.dataframe(sem_match[cols].head(10))
+
+    return df
+
+
+def merge_control_desk_direto(df, control_desk_df, coluna_chave_relatorio='os_contrato', nome_cliente="Relatório"):
+    """
+    Merge DIRETO (sem extrair número após a barra), usado no fluxo REVIVER:
+    - Compara a coluna-chave do relatório (ex: 'Contrato/OS') diretamente com 'COD EXTERNO'
+    - Traz o 'PROCESSO'
+    """
+    if coluna_chave_relatorio not in df.columns:
+        st.error(f"❌ Coluna '{coluna_chave_relatorio}' não encontrada no {nome_cliente}!")
+        st.info(f"Colunas disponíveis: {', '.join(df.columns.tolist())}")
+        return df
+
+    if 'COD EXTERNO' not in control_desk_df.columns or 'PROCESSO' not in control_desk_df.columns:
+        st.error("❌ Colunas 'COD EXTERNO' e/ou 'PROCESSO' não encontradas no Control Desk!")
+        st.info(f"Colunas disponíveis: {', '.join(control_desk_df.columns.tolist())}")
+        return df
+
+    with st.spinner("🔄 Realizando merge direto com Control Desk..."):
+        control_desk_df['COD_EXTERNO_STR'] = control_desk_df['COD EXTERNO'].astype(str).str.strip()
+        control_desk_df['COD_EXTERNO_STR'] = control_desk_df['COD_EXTERNO_STR'].str.lstrip('0')
+
+        df['chave_comparacao'] = df[coluna_chave_relatorio].astype(str).str.strip()
+        df['chave_comparacao'] = df['chave_comparacao'].str.lstrip('0')
+
+        mapa_processo = dict(zip(control_desk_df['COD_EXTERNO_STR'], control_desk_df['PROCESSO']))
+        df['informacao_control_desk'] = df['chave_comparacao'].map(mapa_processo)
+        df['informacao_control_desk'] = df['informacao_control_desk'].fillna('NA')
+        df = df.drop(columns=['chave_comparacao'])
+
+        total_matches = (df['informacao_control_desk'] != 'NA').sum()
+        st.success(f"✅ Matches encontrados: {total_matches} de {len(df)}")
+
+        if len(df) > 0:
+            taxa_match = (total_matches / len(df)) * 100
+            st.info(f"📈 Taxa de match: {taxa_match:.2f}%")
+
+        if total_matches > 0:
+            with st.expander("🎯 Exemplos de matches encontrados"):
+                cols = [coluna_chave_relatorio, 'informacao_control_desk']
+                if 'arquivo_origem' in df.columns:
+                    cols.append('arquivo_origem')
+                matches = df[df['informacao_control_desk'] != 'NA'][cols].head(10)
+                st.dataframe(matches)
+
+        sem_match = df[df['informacao_control_desk'] == 'NA']
+        if len(sem_match) > 0:
+            with st.expander("⚠️ Exemplos sem match"):
+                cols = [coluna_chave_relatorio]
                 if 'arquivo_origem' in df.columns:
                     cols.append('arquivo_origem')
                 st.dataframe(sem_match[cols].head(10))
@@ -511,9 +594,8 @@ def reviver_interface():
 
     st.markdown("""
     **Como funciona:**
-    1. O script extrai o número **após a barra** em `os_contrato` (ex: `422633 / 244906` → `244906`)
-    2. Compara com a coluna `COD EXTERNO` do Control Desk
-    3. Quando encontra match, traz a informação da coluna `PROCESSO`
+    1. Compara diretamente a coluna `Contrato/OS` do relatório com a coluna `COD EXTERNO` do Control Desk
+    2. Quando encontra match, traz a informação da coluna `PROCESSO`
     """)
 
     col1, col2 = st.columns(2)
@@ -522,7 +604,7 @@ def reviver_interface():
             "📁 Arquivo do Relatório (Excel)",
             type=["xls", "xlsx"],
             key="reviver_relatorio",
-            help="Arquivo que contém a coluna 'os_contrato'"
+            help="Arquivo que contém a coluna 'Contrato/OS'"
         )
     with col2:
         control_file = st.file_uploader(
@@ -538,10 +620,10 @@ def reviver_interface():
             colunas_relatorio = df_temp.columns.tolist()
 
             coluna_os = st.selectbox(
-                "🔍 Selecione a coluna que contém 'os_contrato' no relatório:",
+                "🔍 Selecione a coluna que contém 'Contrato/OS' no relatório:",
                 options=colunas_relatorio,
-                index=colunas_relatorio.index('os_contrato') if 'os_contrato' in colunas_relatorio else 0,
-                help="Esta coluna deve conter valores como '422633 / 244906'",
+                index=_sugerir_coluna(colunas_relatorio, ['contrato/os', 'contrato / os', 'os_contrato']),
+                help="Esta coluna será comparada diretamente com 'COD EXTERNO'",
                 key="reviver_coluna_os"
             )
         except Exception:
@@ -571,22 +653,16 @@ def reviver_interface():
                     st.info(f"Colunas disponíveis: {', '.join(df_relatorio.columns.tolist())}")
                     return
 
-                if coluna_os != 'os_contrato':
-                    df_relatorio.rename(columns={coluna_os: 'os_contrato'}, inplace=True)
-
-                df_resultado = merge_control_desk_melhorado(df_relatorio, df_control, "Relatório REVIVER")
+                df_resultado = merge_control_desk_direto(df_relatorio, df_control, coluna_os, "Relatório REVIVER")
                 df_resultado = limpar_df(df_resultado)
 
                 st.subheader("📊 Resultado do Merge")
                 st.dataframe(df_resultado.head(100))
 
-                col1, col2, col3 = st.columns(3)
+                col1, col2 = st.columns(2)
                 with col1:
                     st.metric("Total de linhas", len(df_resultado))
                 with col2:
-                    total_com_numero = df_resultado['numero_extraido'].notna().sum()
-                    st.metric("Com número extraído", total_com_numero)
-                with col3:
                     total_matches = (df_resultado['informacao_control_desk'] != 'NA').sum()
                     st.metric("Matches encontrados", total_matches)
 
@@ -598,8 +674,7 @@ def reviver_interface():
                     if not matches.empty:
                         matches.to_excel(writer, index=False, sheet_name='Apenas_Matches')
 
-                    sem_match = df_resultado[(df_resultado['numero_extraido'].notna()) &
-                                              (df_resultado['informacao_control_desk'] == 'NA')]
+                    sem_match = df_resultado[df_resultado['informacao_control_desk'] == 'NA']
                     if not sem_match.empty:
                         sem_match.to_excel(writer, index=False, sheet_name='Sem_Match')
 
@@ -817,13 +892,49 @@ def compensado_interface():
             # 6. Padroniza os nomes das colunas-chave para o merge
             df_unido = df_unido.rename(columns={col_venc_rel: 'Parcela'})
             df_titulos = df_titulos.rename(columns={col_chave_tit: 'COD_EXTERNO', col_venc_tit: 'Parcela'})
-
+            
             # 7. Limpa espaços nos valores de texto usados na comparação
             with st.spinner("🧹 Normalizando colunas-chave..."):
+                # Converter para string e remover espaços
                 df_unido['numero_extraido'] = df_unido['numero_extraido'].astype(str).str.strip()
                 df_titulos['COD_EXTERNO'] = df_titulos['COD_EXTERNO'].astype(str).str.strip()
+                
+                # REMOVER ZEROS À ESQUERDA para padronizar a comparação
+                df_unido['numero_extraido'] = df_unido['numero_extraido'].str.lstrip('0')
+                df_titulos['COD_EXTERNO'] = df_titulos['COD_EXTERNO'].str.lstrip('0')
+                
+                # Remover pontos e outros caracteres especiais se necessário
+                df_unido['numero_extraido'] = df_unido['numero_extraido'].str.replace('.', '', regex=False)
+                df_unido['numero_extraido'] = df_unido['numero_extraido'].str.replace(',', '', regex=False)
+                df_titulos['COD_EXTERNO'] = df_titulos['COD_EXTERNO'].str.replace('.', '', regex=False)
+                df_titulos['COD_EXTERNO'] = df_titulos['COD_EXTERNO'].str.replace(',', '', regex=False)
+                
+                # Padronizar Parcela (remover espaços extras)
                 df_unido['Parcela'] = df_unido['Parcela'].astype(str).str.strip()
                 df_titulos['Parcela'] = df_titulos['Parcela'].astype(str).str.strip()
+                
+                # 🔍 DEBUG: Mostrar valores para verificar
+                st.write("### 🔍 Verificação dos dados após normalização")
+                col_debug1, col_debug2 = st.columns(2)
+                with col_debug1:
+                    st.write("**Relatório (numero_extraido):**")
+                    st.dataframe(df_unido[['numero_extraido']].head(10))
+                with col_debug2:
+                    st.write("**Títulos (COD_EXTERNO):**")
+                    st.dataframe(df_titulos[['COD_EXTERNO']].head(10))
+                
+                # Verificar quantos valores se sobrepõem
+                valores_rel = set(df_unido['numero_extraido'].astype(str))
+                valores_tit = set(df_titulos['COD_EXTERNO'].astype(str))
+                interseccao = valores_rel.intersection(valores_tit)
+                
+                st.info(f"📊 Valores em comum entre numero_extraido e COD_EXTERNO: {len(interseccao)}")
+                if len(interseccao) > 0:
+                    st.success(f"✅ Exemplos de matches: {list(interseccao)[:10]}")
+                else:
+                    st.warning("⚠️ NENHUM match encontrado entre numero_extraido e COD_EXTERNO!")
+                    st.write("Exemplos do relatório (numero_extraido):", list(valores_rel)[:10])
+                    st.write("Exemplos do título (COD_EXTERNO):", list(valores_tit)[:10])
 
             st.info(f"📊 Relatórios unidos: {len(df_unido)} linhas | Títulos Cadastrados: {len(df_titulos)} linhas")
 
